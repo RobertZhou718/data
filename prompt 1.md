@@ -6,12 +6,13 @@
 在 KAV2 中实现 medium/low_intent 候选结果的 "Sure, Explain" 功能。按以下步骤改动，不改 PendingInteraction，不改 API 响应模型。
 
 1. 请求新增 Action
-   - Chat 请求模型 → KaV2ChatService → KaV2RequestContext 透传一个可选字段 Action（string?）。
+   - Chat 请求模型 → KaV2ChatService → KaV2ChatFlowInput → adapter 透传一个可选字段 Action（string?）。
    - 前端点击按钮时发送：{ "query": "<按钮显示文本>", "action": "explain_candidates" }。query 照常作为用户消息存入对话记录，后端判断只看 action，不看文本。
 
-2. KaV2WorkflowFunction.CreateExecutionPlan（第 235 行前）加确定性快路径：
+2. 确定性路由：用现有的 agent override 机制直接生成 Understanding 结果（不要只在 CreateExecutionPlan 里局部改写，避免执行计划与持久化的 understanding 不一致）。
+   请确认 override 时是否完全跳过 understanding 的 LLM 调用。
    若 request.Action == "explain_candidates"（定义为常量），且 taskContext.CandidateSets.LastOrDefault() 存在且 Options ≥ 2，
-   则把 understanding 改写为：TurnKind=compare_sources，ReferenceStatus=resolved，CandidateSetId=该 set，
+   则 Understanding 输出为：TurnKind=compare_sources，ReferenceStatus=resolved，CandidateSetId=该 set，
    SelectedOptionIds=全部 option.SourceId（按 DisplayIndex），TopicTransition=false，DisplayQuery=""，
    ResolvedRequest = ActiveTask.CurrentGoal ?? ActiveTask.OriginalQuestion ?? request.Query。
    其余流程复用现有逻辑（应得到 SelectedSources + Compare，TaskId 不变，候选集保留）。
@@ -20,6 +21,7 @@
 3. CreateResponsePolicy：decision 算出后，若 Pattern 为 multiple_candidates_search_results_medium_confidence 或 multiple_candidates_search_results_low_intent，
    且 BuildCandidatePages(providerResult.Evidence.Items.Take(MaximumSelectedResultCount)).Count == 1，
    改为 multiple_candidates_best_guess_high_confidence，contentPanel=source（confidence/reasonCode 不变）。
+   单候选完全复用 R9 的输出（标题、该来源 2–3 条摘要、固定下一步文案），不另做单条候选列表或新文案。
    需要时把 providerResult 的作用域提到外层。这样 medium/low_intent 返回时一定有 ≥ 2 个候选页，前端据此显示按钮。
 
 4. KaV2FinalResponseRestorer.Restore：让 LinkCandidateTitles 接收按显示顺序排列的 (Title, Url) 序列；
@@ -29,8 +31,8 @@
 5. ka-agents-config.json 的 prompt：
    - candidate-response-agent：替换 medium 与 low_intent 分支，删除 "Which page would you like to view?"：
      "For multiple_candidates_search_results_medium_confidence and multiple_candidates_search_results_low_intent: introduce the list with exactly: "I found these results:" Present every result neutrally as **Exact supplied page title** — one short plain statement of what it covers. Do not call a result a page or a document unless its title does. After the list, end with exactly: "Select a title to open it. Would you like me to explain how these results differ and when to use each?" Never mention buttons or other interface controls."
-     best-guess 分支补充："With exactly one candidate page, introduce it with exactly: "I found a page that looks most relevant:" and give its single entry."
-   - grounded-response-agent：替换 source_comparison 分支：
+     best-guess 分支不改。
+   - grounded-response-agent：替换 source_comparison 分支（只维护一种比较行为：普通 source_comparison 与 "Sure, Explain" 共用此格式，不新增专属模式）：
      "For source_comparison: stay under 90 words. You may open with one sentence on how the results differ, only if the evidence supports it. Then, for each compared source in the supplied order, write its **exact supplied title** followed by one or two short sentences on when to use it ("Use this for…" / "Use this when…"), choosing the points that matter most for executionPlan.resolvedRequest. Describe differences; never rank or recommend. Never repeat or mention the question. No closing sentence, no offer, no source list, no links. Include at least one resultId per compared source in selectedResultIds; citations = []."
    - understanding-agent（处理用户手打 "yes / what's the difference" 的情况），在 compare_sources 定义后加：
      "When the most recent assistant message (the last entry in recentConversation) offered to explain how the listed results differ and the employee accepts (for example "yes", "sure, explain", or "what's the difference?"), use compare_sources with referenceStatus = resolved, candidateSetId = availableChoices.choiceSetId, and selectedOptionIds = every sourceId in availableChoices. Never treat an earlier offer as pending."
@@ -45,15 +47,15 @@
 7. 更新 kc-agent-bl/KaV2-Flow-Design.md：
    - 请求契约新增 action；
    - Discovery 矩阵 medium/low_intent 行（单页 → best-guess）；
-   - Non-discovery policies 的 compare 行（新的解释格式）；
+   - Non-discovery policies 的 compare 行（新的解释格式，普通比较同样适用）；
    - 新增 Turn 3 示例：action=explain_candidates → compare。
 
-不在本次范围：用 action 跳过 Understanding 节点（后续性能优化）、清理 PendingInteraction（另开 PR）。
+不在本次范围：后端 action 过期/消息绑定校验（由前端在下一轮让按钮失效）、新增或修改 PendingInteraction（另开 PR 清理）。
 
 完成后列出改动文件和测试结果。
 ```
 
 ## 前端约定
 
-- 只在 `responsePattern` 为 `multiple_candidates_search_results_medium_confidence` 或 `multiple_candidates_search_results_low_intent` 时显示按钮，且只在最新一条消息上显示。
+- 只在 `responsePattern` 为 `multiple_candidates_search_results_medium_confidence` 或 `multiple_candidates_search_results_low_intent` 时显示按钮，且只在最新一条消息上显示；用户未点击就进入下一轮时，按钮失效。
 - 点击发送 `action: "explain_candidates"`；按钮文本跟随 UI 语言，后端不依赖文本。
